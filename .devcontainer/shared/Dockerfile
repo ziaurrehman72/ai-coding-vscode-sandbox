@@ -41,8 +41,12 @@ RUN apt-get update \
 
 
 # --- SECURITY: Squid proxy + iptables for domain-based egress filtering ---
+# squid-openssl (not the GnuTLS "squid" build): some clients send full-URL
+# HTTPS requests instead of CONNECT tunnels, e.g. the Claude Code VS Code
+# extension's login token exchange. Only the OpenSSL build can forward those,
+# and it verifies server certificates against the system CA store.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends squid iptables \
+    && apt-get install -y --no-install-recommends squid-openssl iptables \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/log/squid /var/spool/squid /var/cache/squid \
     && chown -R proxy:proxy /var/log/squid /var/spool/squid /var/cache/squid
@@ -59,10 +63,35 @@ RUN find / -path /proc -prune -o -path /sys -prune -o -type f -perm /6000 -print
     | xargs -r chmod u-s,g-s 2>/dev/null || true
 
 
+# --- Python Dev Tools via pipx (poetry, black, ruff, ipython), installed system-wide ---
+# /home/vscode is an empty tmpfs at runtime, so anything installed into it here
+# would be hidden. Installing into /opt + /usr/local/bin keeps the tools visible
+# and, on the read-only root fs, tamper-proof. The PIPX_* vars apply to this step
+# only: at runtime `pipx install <tool>` still works and goes to ~/.local
+# (writable, but wiped on restart).
+RUN export PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin \
+        PIPX_MAN_DIR=/usr/local/share/man PIP_NO_CACHE_DIR=1 \
+    && pipx install poetry \
+    && pipx install black \
+    && pipx install ruff \
+    && pipx install ipython \
+    && rm -rf /root/.cache
+
+# --- Home skeleton: base image dotfiles (.zshrc, Oh My Zsh, .bashrc, ...) ---
+# Copied into the empty tmpfs home by entrypoint.sh on every start.
+RUN cp -a /home/vscode /opt/home-skel
+
+
 # --- SECURITY: Egress firewall script (runs at container start via entrypoint) ---
-COPY allowed-domains.conf /usr/local/etc/allowed-domains.conf
+# Domain files: common.conf + per-assistant files, selected at runtime by AI_PROFILE.
+COPY domains/ /usr/local/etc/allowed-domains.d/
 COPY egress-firewall.sh /usr/local/bin/egress-firewall.sh
 RUN chmod +x /usr/local/bin/egress-firewall.sh
+
+# --- SECURITY: Claude Code managed settings (deny reads of secret files) ---
+# Lives on the read-only root fs, so the agent cannot edit it. Managed settings
+# take precedence over user/project settings. Harmless when Claude isn't installed.
+COPY claude-managed-settings.json /etc/claude-code/managed-settings.json
 
 # --- SECURITY: Entrypoint + /etc/environment for --read-only mode ---
 # Pre-populate /etc/environment (VS Code can't patch it on read-only fs).
@@ -82,20 +111,14 @@ USER vscode
 WORKDIR /home/vscode
 
 
-# --- Python Dev Tools via pipx (poetry, black, ruff, ipython) ---
-RUN pipx install poetry \
-    && pipx install black \
-    && pipx install ruff \
-    && pipx install ipython \
-    && pipx ensurepath
-
-
-# Oh My Zsh: pre-installed in base image, no action needed.
-
-
 # --- Default Shell & PATH ---
+# ~/.local/bin holds tools a user installs at runtime (session-only).
 ENV SHELL=/usr/bin/zsh
 ENV PATH="/home/vscode/.local/bin:${PATH}"
+
+# Keep Poetry virtualenvs in the project (<project>/.venv), which persists.
+# The default (~/.cache/pypoetry/virtualenvs) is on the tmpfs and wiped on restart.
+ENV POETRY_VIRTUALENVS_IN_PROJECT=true
 
 
 # --- Entrypoint (runs as root → starts Squid + iptables → hands off to CMD) ---
